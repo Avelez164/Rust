@@ -1,95 +1,263 @@
-// Cargo.toml dependencies:
-// [dependencies]
-// tokio = { version = "1", features = ["full"] }
+use rand::Rng;
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+    sync::{Arc, Condvar, Mutex},
+    thread,
+    time::Duration,
+};
 
-use std::env;
-use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
-use tokio::time::{sleep, Duration};
+const MAX_DENIES: usize = 3;
 
-const N: usize = 5; // number of philosophers
-
-// A fork is represented as a mutex.
-struct Fork {
-    mutex: Mutex<()>,
+#[derive(Clone)]
+struct Process {
+    _id: usize,           // unused, silences warning
+    _max: Vec<usize>,     // unused, silences warning
+    allocation: Vec<usize>,
+    need: Vec<usize>,
 }
 
-#[tokio::main]
-async fn main() {
-    // Allow a command-line parameter "loops" (default 3)
-    let args: Vec<String> = env::args().collect();
-    let loops: usize = if args.len() > 1 {
-        args[1].parse().unwrap_or(3)
-    } else {
-        3
-    };
+struct Bank {
+    available: Vec<usize>,
+    processes: Vec<Process>,
+}
 
-    // Create a vector of forks (one per philosopher)
-    let forks: Arc<Vec<Arc<Fork>>> = Arc::new(
-        (0..N)
-            .map(|_| Arc::new(Fork { mutex: Mutex::new(()) }))
-            .collect(),
-    );
+struct SafeSeq {
+    seq: Vec<usize>,
+    idx: usize,
+}
 
-    // The "room" semaphore limits concurrent eating attempts to 2.
-    let room = Arc::new(Semaphore::new(2));
+fn read_input(filename: &str) -> (Bank, usize, usize) {
+    let file = File::open(filename).expect("failed to open input file");
+    let mut lines = BufReader::new(file).lines().map(|l| l.unwrap());
 
-    // Spawn one asynchronous task per philosopher.
-    let mut handles = vec![];
-    for id in 0..N {
-        let forks = Arc::clone(&forks);
-        let room = Arc::clone(&room);
-        handles.push(tokio::spawn(async move {
-            philosopher(id, loops, forks, room).await;
+    let first = lines.next().unwrap();
+    let mut parts = first.split_whitespace().map(|s| s.parse::<usize>().unwrap());
+    let p = parts.next().unwrap();
+    let r = parts.next().unwrap();
+
+    let available: Vec<usize> = lines
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
+
+    let mut processes = Vec::with_capacity(p);
+    for id in 0..p {
+        let nums: Vec<usize> = lines
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let max = nums[0..r].to_vec();
+        let allocation = nums[r..2 * r].to_vec();
+        let need = nums[2 * r..3 * r].to_vec();
+        processes.push(Process {
+            _id: id,
+            _max: max,
+            allocation,
+            need,
+        });
+    }
+
+    (Bank { available, processes }, p, r)
+}
+
+fn is_safe_state(bank: &Bank) -> bool {
+    let p = bank.processes.len();
+    let r = bank.available.len();
+    let mut work = bank.available.clone();
+    let mut finish = vec![false; p];
+
+    for _ in 0..p {
+        let mut found = false;
+        for (i, proc) in bank.processes.iter().enumerate() {
+            if !finish[i] && proc.need.iter().zip(&work).all(|(&n, &w)| n <= w) {
+                for j in 0..r {
+                    work[j] += proc.allocation[j];
+                }
+                finish[i] = true;
+                found = true;
+            }
+        }
+        if !found { return false; }
+    }
+    true
+}
+
+fn compute_safe_seq(bank: &Bank) -> Vec<usize> {
+    let p = bank.processes.len();
+    let r = bank.available.len();
+    let mut work = bank.available.clone();
+    let mut finish = vec![false; p];
+    let mut seq = Vec::with_capacity(p);
+
+    for _ in 0..p {
+        let mut found = false;
+        for (i, proc) in bank.processes.iter().enumerate() {
+            if !finish[i] && proc.need.iter().zip(&work).all(|(&n, &w)| n <= w) {
+                for j in 0..r {
+                    work[j] += proc.allocation[j];
+                }
+                finish[i] = true;
+                seq.push(i);
+                found = true;
+                break;
+            }
+        }
+        if !found { panic!("No safe sequence!"); }
+    }
+    seq
+}
+
+fn main() {
+    let filename = std::env::args().nth(1).unwrap_or_else(|| "Bankers_rs.txt".into());
+    let (bank, p, r) = read_input(&filename);
+
+    let safe_seq = compute_safe_seq(&bank);
+    println!("Initial Available: {:?}", bank.available);
+    println!("Safe sequence:   {:?}", safe_seq);
+
+    let bank = Arc::new(Mutex::new(bank));
+    let safe = Arc::new((Mutex::new(SafeSeq { seq: safe_seq, idx: 0 }), Condvar::new()));
+    let total_requests = Arc::new(Mutex::new(0));
+    let granted = Arc::new(Mutex::new(0));
+    let denied = Arc::new(Mutex::new(0));
+
+    let mut handles = Vec::with_capacity(p);
+    for id in 0..p {
+        let bank_cl   = Arc::clone(&bank);
+        let safe_cl   = Arc::clone(&safe);
+        let tot_cl    = Arc::clone(&total_requests);
+        let ok_cl     = Arc::clone(&granted);
+        let no_cl     = Arc::clone(&denied);
+
+        handles.push(thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            let mut denies = 0;
+
+            loop {
+                // Check if done
+                {
+                    let mut bk = bank_cl.lock().unwrap();
+                    if bk.processes[id].need.iter().all(|&n| n == 0) {
+                        println!("P{} has finished. Releasing resources.", id);
+                        for j in 0..r {
+                            bk.available[j] += bk.processes[id].allocation[j];
+                            bk.processes[id].allocation[j] = 0;
+                        }
+                        break;
+                    }
+                }
+
+                // Build random request or full-need fallback
+                let fallback = denies >= MAX_DENIES;
+                let mut req = vec![0; r];
+                let mut valid = false;
+                {
+                    let bk = bank_cl.lock().unwrap();
+                    for j in 0..r {
+                        let need = bk.processes[id].need[j];
+                        if need > 0 {
+                            req[j] = if fallback { need } else { rng.gen_range(0..=need) };
+                            if req[j] > 0 { valid = true; }
+                        }
+                    }
+                }
+                if !valid {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+
+                // Fallback branch
+                if fallback {
+                    let (lock, cvar) = &*safe_cl;
+                    // Acquire once, do wait, fallback, advance, notify
+                    let mut seq = lock.lock().unwrap();
+                    while seq.seq[seq.idx] != id {
+                        seq = cvar.wait(seq).unwrap();
+                    }
+
+                    // Perform full-need request
+                    {
+                        let mut bk = bank_cl.lock().unwrap();
+                        println!("P{} requesting full-need: {:?}", id, req);
+                        *tot_cl.lock().unwrap() += 1;
+                        for j in 0..r {
+                            bk.available[j]  -= req[j];
+                            bk.processes[id].allocation[j] += req[j];
+                            bk.processes[id].need[j] = 0;
+                        }
+                        *ok_cl.lock().unwrap() += 1;
+                        println!("Request GRANTED to P{} (fallback)", id);
+                    }
+
+                    // Release resources
+                    {
+                        let mut bk = bank_cl.lock().unwrap();
+                        println!("P{} has finished. Releasing resources.", id);
+                        for j in 0..r {
+                            bk.available[j] += bk.processes[id].allocation[j];
+                            bk.processes[id].allocation[j] = 0;
+                        }
+                    }
+
+                    // Advance and notify
+                    seq.idx += 1;
+                    cvar.notify_all();
+                    break;
+                }
+
+                // Normal randomized request
+                {
+                    let mut bk = bank_cl.lock().unwrap();
+                    println!("P{} requesting: {:?}", id, req);
+                    *tot_cl.lock().unwrap() += 1;
+
+                    // Raw availability check
+                    if req.iter().zip(&bk.available).all(|(&r, &a)| r <= a) {
+                        // Pretend allocate
+                        for j in 0..r {
+                            bk.available[j]  -= req[j];
+                            bk.processes[id].allocation[j] += req[j];
+                            bk.processes[id].need[j] -= req[j];
+                        }
+                        // Safety check
+                        if is_safe_state(&bk) {
+                            println!("Request GRANTED to P{}", id);
+                            *ok_cl.lock().unwrap() += 1;
+                            denies = 0;
+                        } else {
+                            // Roll back
+                            for j in 0..r {
+                                bk.available[j]  += req[j];
+                                bk.processes[id].allocation[j] -= req[j];
+                                bk.processes[id].need[j] += req[j];
+                            }
+                            println!("Request DENIED to P{} (unsafe)", id);
+                            *no_cl.lock().unwrap() += 1;
+                            denies += 1;
+                        }
+                    } else {
+                        println!("Request DENIED to P{} (not enough resources)", id);
+                        *no_cl.lock().unwrap() += 1;
+                        denies += 1;
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(100));
+            }
         }));
     }
 
-    // Wait for all philosophers to finish.
-    for handle in handles {
-        handle.await.unwrap();
+    for h in handles {
+        h.join().unwrap();
     }
-    println!("✅ All philosophers have finished.");
+
+    println!("\nAll processes completed.");
+    println!("Total requests: {}", *total_requests.lock().unwrap());
+    println!("Granted requests: {}", *granted.lock().unwrap());
+    println!("Denied requests: {}", *denied.lock().unwrap());
 }
-
-async fn philosopher(
-    id: usize,
-    loops: usize,
-    forks: Arc<Vec<Arc<Fork>>>,
-    room: Arc<Semaphore>,
-) {
-    for iter in 0..loops {
-        // THINKING phase.
-        println!("P#{} THINKING.", id);
-        sleep(Duration::from_millis(100)).await;
-
-        // Get hungry.
-        println!("P#{} HUNGRY.", id);
-
-        // Acquire a permit from the "room" semaphore.
-        let permit = room.acquire().await.unwrap();
-
-        // Determine the two fork indices: left and right.
-        let left = id;
-        let right = (id + 1) % N;
-        // To avoid deadlock, lock the lower-numbered fork first.
-        let (first, second) = if left < right { (left, right) } else { (right, left) };
-
-        // Pick up forks (lock them).
-        let first_fork = forks[first].mutex.lock().await;
-        let second_fork = forks[second].mutex.lock().await;
-
-        // Begin eating.
-        println!("P#{} EATING (iteration {}/{})", id, iter + 1, loops);
-        sleep(Duration::from_millis(100)).await;
-
-        // Finished eating; forks are released when locks drop.
-        drop(second_fork);
-        drop(first_fork);
-        drop(permit); // leave the room.
-
-        println!("P#{} finished eating and is thinking again.", id);
-    }
-}
-
-// Use pthread_cond variable
-// or we can use tokio:: semaphore
